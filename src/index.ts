@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { NtesClient } from './ntes-client.mjs';
+import { NtesClient } from './ntes-client.js';
 
 const app = express();
 
