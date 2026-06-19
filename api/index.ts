@@ -1,61 +1,47 @@
 import express from 'express';
 import * as cheerio from 'cheerio';
+import { ChildProcess, spawnSync } from 'child_process';
+import { tmpdir } from 'os';
+import { randomBytes } from 'crypto';
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'fs';
+import { join } from 'path';
 
 const BASE = 'https://enquiry.indianrail.gov.in/mntes';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl';
+const NULL = process.platform === 'win32' ? 'nul' : '/dev/null';
+const TIMEOUT = 25000;
 
-class CookieJar {
-  private cookies: Map<string, string> = new Map();
-
-  setFromResponse(res: Response) {
-    const h = res.headers.get('set-cookie');
-    if (!h) return;
-    for (const part of h.split(',')) {
-      const m = part.match(/^([^=]+)=([^;]+)/);
-      if (m) this.cookies.set(m[1].trim(), m[2].trim());
-    }
+function curl(args: string[]): string {
+  const tmp = join(tmpdir(), 'ntes-' + randomBytes(4).toString('hex'));
+  mkdirSync(tmp, { recursive: true });
+  const cj = join(tmp, 'cookies.txt');
+  try {
+    const allArgs = ['-s', '-b', cj, '-c', cj, ...args];
+    const proc = spawnSync(CURL, allArgs, { timeout: TIMEOUT, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    if (proc.error) throw new Error(proc.error.message);
+    if (proc.status !== 0) throw new Error(`curl exited ${proc.status}: ${proc.stderr?.slice(0,200)}`);
+    return proc.stdout;
+  } finally {
+    try { rmSync(tmp, { recursive: true, force: true }); } catch {}
   }
-
-  get header(): string {
-    return Array.from(this.cookies.entries()).map(([k, v]) => `${k}=${v}`).join('; ');
-  }
 }
 
-async function ntesFetch(path: string, options: RequestInit = {}, jar?: CookieJar): Promise<Response> {
-  const headers: Record<string, string> = {
-    'User-Agent': UA,
-    ...(options.headers as Record<string, string> || {})
-  };
-  if (jar && jar.cookies.size > 0) {
-    headers['Cookie'] = jar.header;
-  }
-  const res = await fetch(`${BASE}${path}`, { ...options, headers });
-  if (jar) jar.setFromResponse(res);
-  return res;
+function ntesGet(path: string): void {
+  curl(['-H', `User-Agent: ${UA}`, `${BASE}${path}`]);
 }
 
-async function getCsrf(jar: CookieJar): Promise<{ name: string; value: string }> {
-  await ntesFetch('/q', {}, jar);
-  const body = await ntesFetch(`/GetCSRFToken?t=${Date.now()}`, {}, jar).then(r => r.text());
-  const m = body.match(/name='([^']+)' value='([^']+)'/);
-  if (!m) throw new Error('Failed to get CSRF token: ' + body.slice(0, 200));
-  return { name: m[1], value: m[2] };
+function ntesPost(endpoint: string, form: Record<string, string>): string {
+  ntesGet('/q');
+  const csrfBody = curl(['-H', `User-Agent: ${UA}`, `${BASE}/GetCSRFToken?t=${Date.now()}`]);
+  const m = csrfBody.match(/name='([^']+)' value='([^']+)'/);
+  if (!m) throw new Error('CSRF token not found. Response: ' + csrfBody.slice(0, 300));
+  const params = new URLSearchParams({ lan: 'en', ...form, [m[1]]: m[2] });
+  const fullUrl = `${BASE}${endpoint}`;
+  return curl(['-X', 'POST', '-H', `User-Agent: ${UA}`, '-H', 'Content-Type: application/x-www-form-urlencoded', '-H', `Referer: ${BASE}/q`, '--data-binary', params.toString(), fullUrl]);
 }
 
-async function ntesPost(endpoint: string, formFields: Record<string, string>): Promise<string> {
-  const jar = new CookieJar();
-  const csrf = await getCsrf(jar);
-  const params = new URLSearchParams({ lan: 'en', ...formFields, [csrf.name]: csrf.value });
-  const res = await ntesFetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Referer': `${BASE}/q` },
-    body: params.toString()
-  }, jar);
-  return res.text();
-}
-
-// --- Parsers (same logic, just pure functions) ---
-
+// --- Parsers (same logic as before) ---
 function getDatePane($: cheerio.CheerioAPI, date: string) {
   const paneId = date ? `#train${date.toLowerCase()}` : null;
   let pane = paneId ? $(paneId) : null;
@@ -180,7 +166,7 @@ app.get('/api/spot-train', async (req, res) => {
   const { trainNo, date } = req.query;
   if (!trainNo) { res.status(400).json({ error: 'trainNo is required' }); return; }
   try {
-    const html = await ntesPost('/tr?opt=TrainRunning&subOpt=FindRunningInstance', { jDate: String(date||''), trainNo: String(trainNo) });
+    const html = ntesPost('/tr?opt=TrainRunning&subOpt=FindRunningInstance', { jDate: String(date||''), trainNo: String(trainNo) });
     res.json(parseSpotTrain(html, String(trainNo), String(date||'')));
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -189,7 +175,7 @@ app.get('/api/live-station', async (req, res) => {
   const { station, date } = req.query;
   if (!station) { res.status(400).json({ error: 'station is required' }); return; }
   try {
-    const html = await ntesPost('/q?opt=LiveStation&subOpt=show', { jFromStationInput: String(station).toUpperCase() });
+    const html = ntesPost('/q?opt=LiveStation&subOpt=show', { jFromStationInput: String(station).toUpperCase() });
     res.json(parseLiveStation(html, String(station), String(date||'')));
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -198,7 +184,7 @@ app.get('/api/train-schedule', async (req, res) => {
   const { trainNo } = req.query;
   if (!trainNo) { res.status(400).json({ error: 'trainNo is required' }); return; }
   try {
-    const html = await ntesPost('/q?opt=TrainServiceSchedule&subOpt=show', { trainNo: String(trainNo) });
+    const html = ntesPost('/q?opt=TrainServiceSchedule&subOpt=show', { trainNo: String(trainNo) });
     res.json(parseTrainSchedule(html, String(trainNo)));
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
@@ -207,7 +193,7 @@ app.get('/api/trains-between', async (req, res) => {
   const { from, to, date } = req.query;
   if (!from || !to) { res.status(400).json({ error: 'from and to are required' }); return; }
   try {
-    const html = await ntesPost('/q?opt=TrainsBetweenStation&subOpt=tbs', { jFromStationInput: String(from).toUpperCase(), jToStationInput: String(to).toUpperCase() });
+    const html = ntesPost('/q?opt=TrainsBetweenStation&subOpt=tbs', { jFromStationInput: String(from).toUpperCase(), jToStationInput: String(to).toUpperCase() });
     res.json(parseTrainsBetween(html, String(from), String(to), String(date||'')));
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
