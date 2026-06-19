@@ -8,7 +8,7 @@ import { join } from 'path';
 
 const BASE = 'https://enquiry.indianrail.gov.in/mntes';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-const CURL = process.platform === 'win32' ? 'curl.exe' : 'curl';
+const CURL = 'curl';
 const TIMEOUT = 25000;
 
 function curl(args) {
@@ -195,5 +195,21 @@ app.get('/api/trains-between', (req, res) => {
 });
 
 app.get('/health', (_req, res) => { res.json({ status:'ok', service:'ntes-api' }); });
+
+app.get('/debug', (req, res) => {
+  const info = {};
+  try {
+    const p = spawnSync('curl', ['--version'], { timeout: 5000, encoding: 'utf8', env: { ...process.env, HOME: process.env.HOME || '/tmp' } });
+    info.curl = p.error ? false : true;
+    info.curlVer = p.error ? p.error.message : (p.stdout || '').split('\n')[0];
+  } catch(e) { info.curl = false; info.curlVer = e.message; }
+  try {
+    const p = spawnSync('sh', ['-c', 'command -v curl'], { timeout: 5000, encoding: 'utf8' });
+    info.curlPath = (p.stdout || '').trim() || 'not found';
+  } catch(e) { info.curlPath = e.message; }
+  info.platform = process.platform;
+  info.node = process.version;
+  res.json(info);
+});
 
 export default app;
