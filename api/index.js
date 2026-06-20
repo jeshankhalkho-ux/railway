@@ -1,58 +1,48 @@
 import express from 'express';
 import * as cheerio from 'cheerio';
 import https from 'https';
+import http from 'http';
 
 const BASE_HOST = 'enquiry.indianrail.gov.in';
 const BASE_PATH = '/mntes';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
-function httpsGet(path, cookies) {
+function httpRequest(useTls, method, host, path, body, cookies, timeout) {
   return new Promise((resolve, reject) => {
-    const opts = { hostname: BASE_HOST, path: BASE_PATH + path, port: 443, headers: { 'User-Agent': UA } };
-    if (cookies) opts.headers['Cookie'] = cookies;
-    https.get(opts, (res) => {
-      const ck = res.headers['set-cookie'];
-      const newCookies = ck ? ck.join('; ') : cookies;
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => resolve({ body: data, cookies: newCookies }));
-    }).on('error', reject);
-  });
-}
-
-function httpsPost(path, body, cookies) {
-  return new Promise((resolve, reject) => {
-    const encBody = new URLSearchParams(body).toString();
+    const mod = useTls ? https : http;
+    const encBody = body ? new URLSearchParams(body).toString() : null;
     const opts = {
-      hostname: BASE_HOST, path: BASE_PATH + path, port: 443, method: 'POST',
-      headers: {
-        'User-Agent': UA,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(encBody),
-        'Referer': 'https://' + BASE_HOST + BASE_PATH + '/q',
-      },
+      hostname: host, path, port: useTls ? 443 : 80, method,
+      headers: { 'User-Agent': UA },
+      timeout: timeout || 15000,
     };
     if (cookies) opts.headers['Cookie'] = cookies;
-    const req = https.request(opts, (res) => {
+    if (encBody) {
+      opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      opts.headers['Content-Length'] = Buffer.byteLength(encBody);
+      opts.headers['Referer'] = 'https://' + BASE_HOST + BASE_PATH + '/q';
+    }
+    const req = mod.request(opts, (res) => {
       const ck = res.headers['set-cookie'];
       const newCookies = ck ? ck.join('; ') : cookies;
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => resolve({ body: data, cookies: newCookies }));
+      res.on('end', () => resolve({ body: data, cookies: newCookies, status: res.statusCode }));
     });
+    req.on('timeout', () => { req.destroy(); reject(new Error('TIMEOUT')); });
     req.on('error', reject);
-    req.write(encBody);
+    if (encBody) req.write(encBody);
     req.end();
   });
 }
 
 async function fetchNTES(endpoint, form) {
-  const s1 = await httpsGet('/q', '');
-  const tokenBody = await httpsGet('/GetCSRFToken?t=' + Date.now(), s1.cookies);
+  const s1 = await httpRequest(true, 'GET', BASE_HOST, BASE_PATH + '/q', null, '', 20000);
+  const tokenBody = await httpRequest(true, 'GET', BASE_HOST, BASE_PATH + '/GetCSRFToken?t=' + Date.now(), null, s1.cookies, 20000);
   const m = tokenBody.body.match(/name='([^']+)' value='([^']+)'/);
   if (!m) throw new Error('CSRF token not found. Response: ' + tokenBody.body.slice(0, 300));
   const sep = endpoint.includes('?') ? '&' : '?';
-  const r = await httpsPost(endpoint + sep + 'lan=en', { ...form, [m[1]]: m[2] }, tokenBody.cookies);
+  const r = await httpRequest(true, 'POST', BASE_HOST, BASE_PATH + endpoint + sep + 'lan=en', { ...form, [m[1]]: m[2] }, tokenBody.cookies, 30000);
   return r.body;
 }
 
@@ -181,7 +171,7 @@ app.get('/api/spot-train', async (req, res) => {
   try {
     const html = await fetchNTES('/tr?opt=TrainRunning&subOpt=FindRunningInstance', { jDate: String(date || ''), trainNo: String(trainNo) });
     res.json(parseSpotTrain(html, String(trainNo), String(date || '')));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
 });
 
 app.get('/api/live-station', async (req, res) => {
@@ -190,7 +180,7 @@ app.get('/api/live-station', async (req, res) => {
   try {
     const html = await fetchNTES('/q?opt=LiveStation&subOpt=show', { jFromStationInput: String(station).toUpperCase() });
     res.json(parseLiveStation(html, String(station), String(date || '')));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
 });
 
 app.get('/api/train-schedule', async (req, res) => {
@@ -199,7 +189,7 @@ app.get('/api/train-schedule', async (req, res) => {
   try {
     const html = await fetchNTES('/q?opt=TrainServiceSchedule&subOpt=show', { trainNo: String(trainNo) });
     res.json(parseTrainSchedule(html, String(trainNo)));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
 });
 
 app.get('/api/trains-between', async (req, res) => {
@@ -208,9 +198,22 @@ app.get('/api/trains-between', async (req, res) => {
   try {
     const html = await fetchNTES('/q?opt=TrainsBetweenStation&subOpt=tbs', { jFromStationInput: String(from).toUpperCase(), jToStationInput: String(to).toUpperCase() });
     res.json(parseTrainsBetween(html, String(from), String(to), String(date || '')));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
 });
 
 app.get('/health', (_req, res) => { res.json({ status: 'ok', service: 'ntes-api' }); });
+
+app.get('/debug', async (_req, res) => {
+  const results = {};
+  for (const host of ['enquiry.indianrail.gov.in', 'www.indianrail.gov.in', 'www.irctc.co.in', 'google.com']) {
+    try {
+      const r = await httpRequest(true, 'GET', host, '/', null, '', 10000);
+      results[host] = { reachable: true, status: r.status, length: r.body.length };
+    } catch (e) {
+      results[host] = { reachable: false, error: e.message };
+    }
+  }
+  res.json(results);
+});
 
 export default app;
