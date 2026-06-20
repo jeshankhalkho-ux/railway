@@ -2,14 +2,14 @@
   "version": 2,
   "builds": [
     {
-      "src": "api/index.mjs",
+      "src": "api/index.ts",
       "use": "@vercel/node"
     }
   ],
   "functions": {
-    "api/index.mjs": { "maxDuration": 60 }
+    "api/index.ts": { "maxDuration": 60 }
   },
   "routes": [
-    { "src": "/(.*)", "dest": "api/index.mjs" }
+    { "src": "/(.*)", "dest": "api/index.ts" }
   ]
 }
