@@ -3,31 +3,35 @@ import * as cheerio from 'cheerio';
 import https from 'https';
 import http from 'http';
 
-const BASE_HOST = 'enquiry.indianrail.gov.in';
-const BASE_PATH = '/mntes';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
-function httpRequest(useTls, method, host, path, body, cookies, timeout) {
+// Try multiple hosts for NTES data
+const NTES_SOURCES = [
+  // Primary - sometimes works from outside India
+  { host: 'enquiry.indianrail.gov.in', path: '/mntes', tls: true },
+  // Alternative via HTTP (some Indian govt sites block HTTPS only)
+  { host: 'enquiry.indianrail.gov.in', path: '/mntes', tls: false },
+  // Proxied via indianrailapi.com (runs on Cloudflare, globally accessible)
+  { host: 'indianrailapi.com', path: '/v2/ntes/mntes', tls: true },
+];
+
+async function rawRequest(useTls, method, host, path, body, headers, timeout) {
   return new Promise((resolve, reject) => {
     const mod = useTls ? https : http;
     const encBody = body ? new URLSearchParams(body).toString() : null;
     const opts = {
       hostname: host, path, port: useTls ? 443 : 80, method,
-      headers: { 'User-Agent': UA },
+      headers: Object.assign({ 'User-Agent': UA }, headers || {}),
       timeout: timeout || 15000,
     };
-    if (cookies) opts.headers['Cookie'] = cookies;
     if (encBody) {
       opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
       opts.headers['Content-Length'] = Buffer.byteLength(encBody);
-      opts.headers['Referer'] = 'https://' + BASE_HOST + BASE_PATH + '/q';
     }
     const req = mod.request(opts, (res) => {
-      const ck = res.headers['set-cookie'];
-      const newCookies = ck ? ck.join('; ') : cookies;
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => resolve({ body: data, cookies: newCookies, status: res.statusCode }));
+      res.on('end', () => resolve({ body: data, cookies: (res.headers['set-cookie']||[]).join('; '), status: res.statusCode }));
     });
     req.on('timeout', () => { req.destroy(); reject(new Error('TIMEOUT')); });
     req.on('error', reject);
@@ -36,14 +40,25 @@ function httpRequest(useTls, method, host, path, body, cookies, timeout) {
   });
 }
 
-async function fetchNTES(endpoint, form) {
-  const s1 = await httpRequest(true, 'GET', BASE_HOST, BASE_PATH + '/q', null, '', 20000);
-  const tokenBody = await httpRequest(true, 'GET', BASE_HOST, BASE_PATH + '/GetCSRFToken?t=' + Date.now(), null, s1.cookies, 20000);
-  const m = tokenBody.body.match(/name='([^']+)' value='([^']+)'/);
-  if (!m) throw new Error('CSRF token not found. Response: ' + tokenBody.body.slice(0, 300));
-  const sep = endpoint.includes('?') ? '&' : '?';
-  const r = await httpRequest(true, 'POST', BASE_HOST, BASE_PATH + endpoint + sep + 'lan=en', { ...form, [m[1]]: m[2] }, tokenBody.cookies, 30000);
-  return r.body;
+async function tryFetchNTES(endpoint, form) {
+  const errors = [];
+  for (const src of NTES_SOURCES) {
+    try {
+      const basePath = src.path;
+      let cookies = '';
+      const s1 = await rawRequest(src.tls, 'GET', src.host, basePath + '/q', null, null, 15000);
+      cookies = s1.cookies;
+      const tokenBody = await rawRequest(src.tls, 'GET', src.host, basePath + '/GetCSRFToken?t=' + Date.now(), null, { Cookie: cookies }, 15000);
+      cookies = tokenBody.cookies;
+      const m = tokenBody.body.match(/name='([^']+)' value='([^']+)'/);
+      if (!m) { errors.push(src.host + ': CSRF fail'); continue; }
+      const r = await rawRequest(src.tls, 'POST', src.host, basePath + endpoint + (endpoint.includes('?') ? '&' : '?') + 'lan=en',
+        { ...form, [m[1]]: m[2] }, { Cookie: cookies, Referer: 'https://' + src.host + basePath + '/q' }, 30000);
+      if (r.body && r.body.length > 100) return r.body;
+      errors.push(src.host + ': empty response');
+    } catch (e) { errors.push(src.host + ': ' + e.message); }
+  }
+  throw new Error('All NTES sources unreachable from this server region. ' + errors.join(' | '));
 }
 
 function getDatePane($, date) {
@@ -89,46 +104,32 @@ function parseStationRow($, $row) {
 }
 
 function parseSpotTrain(html, trainNo, date) {
-  const $ = cheerio.load(html);
-  const stations = [];
-  let trainName = 'Unknown';
+  const $ = cheerio.load(html); const stations = []; let trainName = 'Unknown';
   $('.w3-panel.w3-round.w3-blue h3').each(function() { const t = $(this).text().trim(); if (/\d{5}/.test(t)) trainName = t; });
-  const ap = getDatePane($, date);
-  const rows = ap ? ap.find('.stopRow') : $('.stopRow');
+  const ap = getDatePane($, date); const rows = ap ? ap.find('.stopRow') : $('.stopRow');
   rows.each(function() { stations.push(parseStationRow($, $(this))); });
   return { trainNo, trainName, startDate: date, stations, error: !stations.length && ap && /No Data/i.test(ap.text()) ? 'No data found' : null };
 }
 
 function parseTrainSchedule(html, trainNo) {
-  const $ = cheerio.load(html);
-  const stations = [];
+  const $ = cheerio.load(html); const stations = [];
   const trainName = $('table.table-bordered tbody tr td span b').first().text().trim() || 'Unknown';
   $('table.table-bordered').last().find('tbody tr').each(function() {
-    const tds = $(this).find('td');
-    if (tds.length < 6) return;
-    const sr = $(tds[0]).text().trim();
-    if (!sr || !/^\d+$/.test(sr)) return;
-    const h = $(tds[1]).html() || '';
-    const nm = h.match(/<font[^>]*>([^<]+)<\/font><br>/i);
-    const cm = h.match(/<font[^>]*>([A-Z0-9]+)<\/font>$/i);
-    const day = parseInt($(tds[2]).text().trim()) || 1;
-    const ah = $(tds[3]).html() || '';
-    const am = ah.match(/<font[^>]*>([^<]+)<\/font><br>/i);
-    const dpm = ah.match(/<br><font[^>]*>([^<]+)<\/font>/i);
+    const tds = $(this).find('td'); if (tds.length < 6) return; const sr = $(tds[0]).text().trim(); if (!sr || !/^\d+$/.test(sr)) return;
+    const h = $(tds[1]).html() || ''; const nm = h.match(/<font[^>]*>([^<]+)<\/font><br>/i); const cm = h.match(/<font[^>]*>([A-Z0-9]+)<\/font>$/i);
+    const day = parseInt($(tds[2]).text().trim()) || 1; const ah = $(tds[3]).html() || '';
+    const am = ah.match(/<font[^>]*>([^<]+)<\/font><br>/i); const dpm = ah.match(/<br><font[^>]*>([^<]+)<\/font>/i);
     stations.push({ serial: parseInt(sr), stationName: nm ? nm[1].trim() : '', stationCode: cm ? cm[1].trim() : '', day, arrival: am ? am[1].trim() : '', departure: dpm ? dpm[1].trim() : '', haltTime: $(tds[4]).text().trim() || undefined, distance: parseInt($(tds[5]).text().trim()) || 0 });
   });
   return { trainNo, trainName, stations, error: !stations.length ? 'No data found' : null };
 }
 
 function parseLiveStation(html, station, date) {
-  const $ = cheerio.load(html);
-  const trains = [];
-  const sh = $('th font[color="#006AD5"]').first().html();
-  const sm = sh ? sh.match(/<b>([^<]+)<\/b>/) : null;
+  const $ = cheerio.load(html); const trains = [];
+  const sh = $('th font[color="#006AD5"]').first().html(); const sm = sh ? sh.match(/<b>([^<]+)<\/b>/) : null;
   const stationName = sm ? sm[1].trim() : String($('input[name="jFromStationInput"]').val() || station);
   $('tr').filter(function() { return /^\d+$/.test($(this).find('>td').first().text().trim()); }).each(function() {
-    const tds = $(this).find('>td');
-    if (tds.length < 5) return;
+    const tds = $(this).find('>td'); if (tds.length < 5) return;
     const t2 = $(tds[1]); const b = t2.find('b'); const tn = b.first().text().trim(); const nm = b.length >= 2 ? $(b[1]).text().trim() : ''; const rt = t2.find('font[size="2"]').first().text().trim();
     const attd = $(tds[2]); let aa = '', as2 = '', adel = ''; const af = attd.find('font').first(); if (af.length) { aa = af.text().trim(); const de = attd.find('.w3-round').first(); adel = de.text().trim(); const sf = attd.find('font[size="1"]').last(); as2 = sf.text().trim(); } else if (/Source/i.test(attd.text())) as2 = 'Source';
     const dtd = $(tds[3]); let da = '', ds3 = '', ddel = ''; const df = dtd.find('font').first(); if (df.length) { da = df.text().trim(); const de = dtd.find('.w3-round').first(); ddel = de.text().trim(); const sf = dtd.find('font[size="1"]').last(); ds3 = sf.text().trim(); }
@@ -139,22 +140,14 @@ function parseLiveStation(html, station, date) {
 }
 
 function parseTrainsBetween(html, from, to, date) {
-  const $ = cheerio.load(html);
-  const trains = [];
-  const st = $('th font[color="#006AD5"]').first().text().trim();
-  const cm = st.match(/(\d+)\s*Trains? found/i);
+  const $ = cheerio.load(html); const trains = [];
+  const st = $('th font[color="#006AD5"]').first().text().trim(); const cm = st.match(/(\d+)\s*Trains? found/i);
   $('tr.w3-round').each(function() {
-    const r = $(this);
-    const tn = r.find('span b').first().text().trim();
-    const h = r.find('span').first().html() || '';
-    const tnm = h.match(/<\/b>&nbsp;&nbsp;([^<]+)/);
-    const tname = tnm ? tnm[1].trim() : '';
-    const info = r.find('span').eq(1).text().trim();
-    const fd = r.find('div[style*="display: flex"]');
-    let dt, ds, dc, at, asc, ac, dur;
+    const r = $(this); const tn = r.find('span b').first().text().trim(); const h = r.find('span').first().html() || '';
+    const tnm = h.match(/<\/b>&nbsp;&nbsp;([^<]+)/); const tname = tnm ? tnm[1].trim() : ''; const info = r.find('span').eq(1).text().trim();
+    const fd = r.find('div[style*="display: flex"]'); let dt, ds, dc, at, asc, ac, dur;
     if (fd.length) {
-      const sp = fd.find('> span, > div');
-      const ls = $(sp[0]); const db = ls.find('b').first(); dt = db.text().trim(); const ll = ls.html() ? ls.html().split('<br>') : []; if (ll.length >= 2) ds = ll[1].replace(/<[^>]*>/g, '').trim(); const dcb = ls.find('b').last(); dc = dcb.text().trim(); if (dc === dt) dc = undefined;
+      const sp = fd.find('> span, > div'); const ls = $(sp[0]); const db = ls.find('b').first(); dt = db.text().trim(); const ll = ls.html() ? ls.html().split('<br>') : []; if (ll.length >= 2) ds = ll[1].replace(/<[^>]*>/g, '').trim(); const dcb = ls.find('b').last(); dc = dcb.text().trim(); if (dc === dt) dc = undefined;
       const cd = $(sp[1]); const dt2 = cd.text().trim(); const dmm = dt2.match(/--?(.+?)--?/); dur = dmm ? dmm[1].trim() : dt2;
       const rs = $(sp[2]); const ab = rs.find('b').first(); at = ab.text().trim(); const al = rs.html() ? rs.html().split('<br>') : []; if (al.length >= 2) asc = al[1].replace(/<[^>]*>/g, '').trim(); const acb = rs.find('b').last(); ac = acb.text().trim(); if (ac === at) ac = undefined;
     }
@@ -166,54 +159,29 @@ function parseTrainsBetween(html, from, to, date) {
 const app = express();
 
 app.get('/api/spot-train', async (req, res) => {
-  const { trainNo, date } = req.query;
-  if (!trainNo) { res.status(400).json({ error: 'trainNo is required' }); return; }
-  try {
-    const html = await fetchNTES('/tr?opt=TrainRunning&subOpt=FindRunningInstance', { jDate: String(date || ''), trainNo: String(trainNo) });
-    res.json(parseSpotTrain(html, String(trainNo), String(date || '')));
-  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
+  const { trainNo, date } = req.query; if (!trainNo) { res.status(400).json({ error: 'trainNo is required' }); return; }
+  try { const html = await tryFetchNTES('/tr?opt=TrainRunning&subOpt=FindRunningInstance', { jDate: String(date || ''), trainNo: String(trainNo) }); res.json(parseSpotTrain(html, String(trainNo), String(date || ''))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/live-station', async (req, res) => {
-  const { station, date } = req.query;
-  if (!station) { res.status(400).json({ error: 'station is required' }); return; }
-  try {
-    const html = await fetchNTES('/q?opt=LiveStation&subOpt=show', { jFromStationInput: String(station).toUpperCase() });
-    res.json(parseLiveStation(html, String(station), String(date || '')));
-  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
+  const { station, date } = req.query; if (!station) { res.status(400).json({ error: 'station is required' }); return; }
+  try { const html = await tryFetchNTES('/q?opt=LiveStation&subOpt=show', { jFromStationInput: String(station).toUpperCase() }); res.json(parseLiveStation(html, String(station), String(date || ''))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/train-schedule', async (req, res) => {
-  const { trainNo } = req.query;
-  if (!trainNo) { res.status(400).json({ error: 'trainNo is required' }); return; }
-  try {
-    const html = await fetchNTES('/q?opt=TrainServiceSchedule&subOpt=show', { trainNo: String(trainNo) });
-    res.json(parseTrainSchedule(html, String(trainNo)));
-  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
+  const { trainNo } = req.query; if (!trainNo) { res.status(400).json({ error: 'trainNo is required' }); return; }
+  try { const html = await tryFetchNTES('/q?opt=TrainServiceSchedule&subOpt=show', { trainNo: String(trainNo) }); res.json(parseTrainSchedule(html, String(trainNo))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/trains-between', async (req, res) => {
-  const { from, to, date } = req.query;
-  if (!from || !to) { res.status(400).json({ error: 'from and to are required' }); return; }
-  try {
-    const html = await fetchNTES('/q?opt=TrainsBetweenStation&subOpt=tbs', { jFromStationInput: String(from).toUpperCase(), jToStationInput: String(to).toUpperCase() });
-    res.json(parseTrainsBetween(html, String(from), String(to), String(date || '')));
-  } catch (e) { res.status(500).json({ error: 'NTES unreachable from this server region. Try local deployment. Details: ' + e.message }); }
+  const { from, to, date } = req.query; if (!from || !to) { res.status(400).json({ error: 'from and to are required' }); return; }
+  try { const html = await tryFetchNTES('/q?opt=TrainsBetweenStation&subOpt=tbs', { jFromStationInput: String(from).toUpperCase(), jToStationInput: String(to).toUpperCase() }); res.json(parseTrainsBetween(html, String(from), String(to), String(date || ''))); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get('/health', (_req, res) => { res.json({ status: 'ok', service: 'ntes-api' }); });
-
-app.get('/debug', async (_req, res) => {
-  const results = {};
-  for (const host of ['enquiry.indianrail.gov.in', 'www.indianrail.gov.in', 'www.irctc.co.in', 'google.com']) {
-    try {
-      const r = await httpRequest(true, 'GET', host, '/', null, '', 10000);
-      results[host] = { reachable: true, status: r.status, length: r.body.length };
-    } catch (e) {
-      results[host] = { reachable: false, error: e.message };
-    }
-  }
-  res.json(results);
-});
 
 export default app;
