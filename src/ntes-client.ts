@@ -23,6 +23,7 @@ export class NtesClient {
 
   destroy() {
     try { rmSync(this.tmpDir, { recursive: true, force: true }); } catch {}
+  }
 
   _getCsrf() {
     this.curl(`"${BASE}/q" > ${NULL}`);
