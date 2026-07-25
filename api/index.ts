@@ -1,5 +1,4 @@
 import express from "express";
-import path from "path";
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -31,15 +30,6 @@ app.use("/api/railway", async (req, res) => {
   } catch {
     res.status(500).json({ error: "Internal server error while fetching railway data." });
   }
-});
-
-const distPath = path.resolve(process.cwd(), "dist");
-app.use(express.static(distPath));
-app.get("*", (req, res) => {
-  const indexPath = path.join(distPath, "index.html");
-  res.sendFile(indexPath, (err) => {
-    if (err) res.status(404).json({ error: "Frontend not built. Run 'vite build' first." });
-  });
 });
 
 export default app;
