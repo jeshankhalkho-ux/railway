@@ -1,0 +1,6 @@
+{
+  "name": "Railway Details",
+  "description": "Real-time train status tracking application with secure backend proxy and rate limiting.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
