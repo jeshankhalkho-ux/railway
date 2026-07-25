@@ -33,10 +33,13 @@ app.use("/api/railway", async (req, res) => {
   }
 });
 
-const distPath = path.join(process.cwd(), "dist");
+const distPath = path.resolve(process.cwd(), "dist");
 app.use(express.static(distPath));
 app.get("*", (req, res) => {
-  res.sendFile(path.join(distPath, "index.html"));
+  const indexPath = path.join(distPath, "index.html");
+  res.sendFile(indexPath, (err) => {
+    if (err) res.status(404).json({ error: "Frontend not built. Run 'vite build' first." });
+  });
 });
 
 export default app;
